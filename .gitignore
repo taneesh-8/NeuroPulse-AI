@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# arduino-cli (local tool binary)
+/docs/arduino-cli/
+/docs/arduino-cli.zip
