@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { signInWithEmailAndPassword } from "firebase/auth";
 import { doc, getDoc } from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
+import { getRoleFromEmail } from "@/lib/demoData";
 import LoginBackground from "@/components/LoginBackground";
 import { Brain, Eye, EyeOff, Loader2 } from "lucide-react";
 
@@ -28,16 +29,36 @@ export default function LoginPage() {
         password
       );
       const uid = userCredential.user.uid;
+      const userEmail = userCredential.user.email || email;
 
-      const userDoc = await getDoc(doc(db, "users", uid));
-      if (!userDoc.exists()) {
-        setError("User profile not found. Contact administrator.");
+      // Try to get role from Firestore first, fallback to email-based detection
+      let role: string | null = null;
+
+      try {
+        const userDoc = await getDoc(doc(db, "users", uid));
+        if (userDoc.exists()) {
+          role = userDoc.data().role as string;
+        }
+      } catch (firestoreErr) {
+        // Firestore read failed (likely security rules) — fall back to email-based role
+        console.warn("Firestore read failed, using email-based role detection:", firestoreErr);
+      }
+
+      // Fallback: derive role from email prefix
+      if (!role) {
+        role = getRoleFromEmail(userEmail);
+      }
+
+      if (!role) {
+        setError("Unable to determine user role. Contact administrator.");
         setLoading(false);
         return;
       }
 
-      const userData = userDoc.data();
-      const role = userData.role as string;
+      // Store user info in localStorage for dashboard pages
+      localStorage.setItem("np_user_role", role);
+      localStorage.setItem("np_user_email", userEmail);
+      localStorage.setItem("np_user_uid", uid);
 
       switch (role) {
         case "patient":

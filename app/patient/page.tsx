@@ -14,6 +14,11 @@ import {
   where,
 } from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
+import {
+  getDemoUserProfile,
+  generateDemoReadings,
+  type DemoReading,
+} from "@/lib/demoData";
 import { toast } from "sonner";
 import dynamic from "next/dynamic";
 import Navbar from "@/components/Navbar";
@@ -53,6 +58,7 @@ export default function PatientDashboard() {
   const [patientId, setPatientId] = useState("");
   const [latestReading, setLatestReading] = useState<Reading | null>(null);
   const [chartData, setChartData] = useState<Reading[]>([]);
+  const [usingDemoData, setUsingDemoData] = useState(false);
 
   useEffect(() => {
     const unsubAuth = onAuthStateChanged(auth, async (user) => {
@@ -61,17 +67,42 @@ export default function PatientDashboard() {
         return;
       }
 
-      const userDoc = await getDoc(doc(db, "users", user.uid));
-      if (!userDoc.exists() || userDoc.data().role !== "patient") {
-        router.push("/login");
-        return;
+      // Try Firestore first, fallback to demo data
+      let userData = null;
+      try {
+        const userDoc = await getDoc(doc(db, "users", user.uid));
+        if (userDoc.exists() && userDoc.data().role === "patient") {
+          userData = userDoc.data();
+        }
+      } catch (err) {
+        console.warn("Firestore read failed, using demo data:", err);
       }
 
-      const userData = userDoc.data();
-      setUserName(userData.name || user.email || "");
-      const linkedPatients = userData.linkedPatients || [];
-      const pId = linkedPatients[0] || user.uid;
-      setPatientId(pId);
+      if (userData) {
+        setUserName(userData.name || user.email || "");
+        const linkedPatients = userData.linkedPatients || [];
+        const pId = linkedPatients[0] || user.uid;
+        setPatientId(pId);
+      } else {
+        // Check localStorage role or email-based detection
+        const storedRole = localStorage.getItem("np_user_role");
+        if (storedRole !== "patient") {
+          router.push("/login");
+          return;
+        }
+        const demoProfile = getDemoUserProfile("patient");
+        setUserName(demoProfile.name);
+        setPatientId(demoProfile.linkedPatients[0] || user.uid);
+        setUsingDemoData(true);
+
+        // Load demo chart data
+        const demoReadings = generateDemoReadings(24);
+        setChartData(demoReadings as Reading[]);
+        if (demoReadings.length > 0) {
+          setLatestReading(demoReadings[demoReadings.length - 1] as Reading);
+        }
+      }
+
       setLoading(false);
     });
 
@@ -79,42 +110,74 @@ export default function PatientDashboard() {
   }, [router]);
 
   useEffect(() => {
-    if (!patientId) return;
+    if (!patientId || usingDemoData) return;
 
     const readingsRef = collection(db, "patients", patientId, "readings");
-    const latestQuery = query(readingsRef, orderBy("serverTimestamp", "desc"), limit(1));
 
-    const unsubLatest = onSnapshot(latestQuery, (snapshot) => {
-      if (!snapshot.empty) {
-        const data = snapshot.docs[0].data() as Reading;
-        setLatestReading(data);
+    let unsubLatest: (() => void) | null = null;
+    let unsubChart: (() => void) | null = null;
 
-        if (data.fall) {
-          toast.error("Fall Detected!", {
-            description: "A fall event has been triggered.",
-          });
+    try {
+      const latestQuery = query(readingsRef, orderBy("serverTimestamp", "desc"), limit(1));
+
+      unsubLatest = onSnapshot(
+        latestQuery,
+        (snapshot) => {
+          if (!snapshot.empty) {
+            const data = snapshot.docs[0].data() as Reading;
+            setLatestReading(data);
+
+            if (data.fall) {
+              toast.error("Fall Detected!", {
+                description: "A fall event has been triggered.",
+              });
+            }
+          }
+        },
+        (err) => {
+          console.warn("Firestore readings snapshot failed, loading demo data:", err);
+          setUsingDemoData(true);
+          const demoReadings = generateDemoReadings(24);
+          setChartData(demoReadings as Reading[]);
+          if (demoReadings.length > 0) {
+            setLatestReading(demoReadings[demoReadings.length - 1] as Reading);
+          }
         }
+      );
+
+      const twentyFourHoursAgo = Date.now() - 24 * 60 * 60 * 1000;
+      const chartQuery = query(
+        readingsRef,
+        where("serverTimestamp", ">=", twentyFourHoursAgo),
+        orderBy("serverTimestamp", "asc"),
+        limit(2000)
+      );
+
+      unsubChart = onSnapshot(
+        chartQuery,
+        (snapshot) => {
+          const readings = snapshot.docs.map((d) => d.data() as Reading);
+          setChartData(readings);
+        },
+        (err) => {
+          console.warn("Firestore chart snapshot failed:", err);
+        }
+      );
+    } catch (err) {
+      console.warn("Firestore query setup failed, using demo data:", err);
+      setUsingDemoData(true);
+      const demoReadings = generateDemoReadings(24);
+      setChartData(demoReadings as Reading[]);
+      if (demoReadings.length > 0) {
+        setLatestReading(demoReadings[demoReadings.length - 1] as Reading);
       }
-    });
-
-    const twentyFourHoursAgo = Date.now() - 24 * 60 * 60 * 1000;
-    const chartQuery = query(
-      readingsRef,
-      where("serverTimestamp", ">=", twentyFourHoursAgo),
-      orderBy("serverTimestamp", "asc"),
-      limit(2000)
-    );
-
-    const unsubChart = onSnapshot(chartQuery, (snapshot) => {
-      const readings = snapshot.docs.map((d) => d.data() as Reading);
-      setChartData(readings);
-    });
+    }
 
     return () => {
-      unsubLatest();
-      unsubChart();
+      if (unsubLatest) unsubLatest();
+      if (unsubChart) unsubChart();
     };
-  }, [patientId]);
+  }, [patientId, usingDemoData]);
 
   const r = latestReading;
 
@@ -151,6 +214,12 @@ export default function PatientDashboard() {
             <span className={`text-sm font-bold ${status.color}`}>{status.label}</span>
           </div>
         </div>
+
+        {usingDemoData && (
+          <div className="mb-4 p-3 rounded-xl bg-primary/10 border border-primary/20 text-primary text-sm animate-fade-in">
+            📊 Showing demo data — Firestore connection unavailable
+          </div>
+        )}
 
         <div className="dashboard-grid mb-6">
           <div className="animate-slide-in" style={{ animationDelay: "0ms" }}>

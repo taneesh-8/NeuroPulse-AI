@@ -15,6 +15,14 @@ import {
   getDocs,
 } from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
+import {
+  getDemoUserProfile,
+  getDemoPatients,
+  generateDemoReadings,
+  getDemoAlerts,
+  type DemoReading,
+  type DemoAlert,
+} from "@/lib/demoData";
 import { toast } from "sonner";
 import dynamic from "next/dynamic";
 import Navbar from "@/components/Navbar";
@@ -80,6 +88,7 @@ export default function DoctorDashboard() {
   const [exporting, setExporting] = useState(false);
   const [doctorNotes, setDoctorNotes] = useState("");
   const [savingNotes, setSavingNotes] = useState(false);
+  const [usingDemoData, setUsingDemoData] = useState(false);
 
   useEffect(() => {
     const unsubAuth = onAuthStateChanged(auth, async (user) => {
@@ -88,30 +97,75 @@ export default function DoctorDashboard() {
         return;
       }
 
-      const userDoc = await getDoc(doc(db, "users", user.uid));
-      if (!userDoc.exists() || userDoc.data().role !== "doctor") {
-        router.push("/login");
-        return;
-      }
-
-      const userData = userDoc.data();
-      setUserName(userData.name || user.email || "");
-      const linkedPatients: string[] = userData.linkedPatients || [];
-
-      const patientList: Patient[] = [];
-      for (const pId of linkedPatients) {
-        const pDoc = await getDoc(doc(db, "patients", pId));
-        if (pDoc.exists()) {
-          patientList.push({ id: pId, name: pDoc.data().name || pId });
-        } else {
-          patientList.push({ id: pId, name: pId });
+      // Try Firestore first, fallback to demo data
+      let userData = null;
+      try {
+        const userDoc = await getDoc(doc(db, "users", user.uid));
+        if (userDoc.exists() && userDoc.data().role === "doctor") {
+          userData = userDoc.data();
         }
+      } catch (err) {
+        console.warn("Firestore read failed, using demo data:", err);
       }
 
-      setPatients(patientList);
-      if (patientList.length > 0) {
-        setSelectedPatientId(patientList[0].id);
+      if (userData) {
+        setUserName(userData.name || user.email || "");
+        const linkedPatients: string[] = userData.linkedPatients || [];
+
+        const patientList: Patient[] = [];
+        for (const pId of linkedPatients) {
+          try {
+            const pDoc = await getDoc(doc(db, "patients", pId));
+            if (pDoc.exists()) {
+              patientList.push({ id: pId, name: pDoc.data().name || pId });
+            } else {
+              patientList.push({ id: pId, name: pId });
+            }
+          } catch {
+            patientList.push({ id: pId, name: pId });
+          }
+        }
+
+        setPatients(patientList);
+        if (patientList.length > 0) {
+          setSelectedPatientId(patientList[0].id);
+        }
+      } else {
+        // Check localStorage role
+        const storedRole = localStorage.getItem("np_user_role");
+        if (storedRole !== "doctor") {
+          router.push("/login");
+          return;
+        }
+        const demoProfile = getDemoUserProfile("doctor");
+        setUserName(demoProfile.name);
+        const demoPatients = getDemoPatients();
+        setPatients(demoPatients);
+        if (demoPatients.length > 0) {
+          setSelectedPatientId(demoPatients[0].id);
+        }
+        setUsingDemoData(true);
+
+        // Load demo data
+        const demoReadings = generateDemoReadings(168); // 7 days
+        setChartData(demoReadings as Reading[]);
+        if (demoReadings.length > 0) {
+          setLatestReading(demoReadings[demoReadings.length - 1] as Reading);
+          const validBpm = demoReadings.filter((r) => r.bpm > 0);
+          const validSpo2 = demoReadings.filter((r) => r.spo2 !== -1 && r.spo2 > 0);
+          setStats({
+            avgBpm: validBpm.length > 0
+              ? Math.round(validBpm.reduce((s, r) => s + r.bpm, 0) / validBpm.length)
+              : 0,
+            avgSpo2: validSpo2.length > 0
+              ? Math.round(validSpo2.reduce((s, r) => s + r.spo2, 0) / validSpo2.length)
+              : 0,
+            fallCount: demoReadings.filter((r) => r.fall).length,
+          });
+        }
+        setAlerts(getDemoAlerts() as Alert[]);
       }
+
       setLoading(false);
     });
 
@@ -119,63 +173,114 @@ export default function DoctorDashboard() {
   }, [router]);
 
   useEffect(() => {
-    if (!selectedPatientId) return;
+    if (!selectedPatientId || usingDemoData) return;
 
     const readingsRef = collection(db, "patients", selectedPatientId, "readings");
-    const latestQ = query(readingsRef, orderBy("serverTimestamp", "desc"), limit(1));
 
-    const unsubLatest = onSnapshot(latestQ, (snap) => {
-      if (!snap.empty) {
-        setLatestReading(snap.docs[0].data() as Reading);
-      }
-    });
+    let unsubLatest: (() => void) | null = null;
+    let unsubChart: (() => void) | null = null;
+    let unsubAlerts: (() => void) | null = null;
 
-    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-    const chartQ = query(
-      readingsRef,
-      where("serverTimestamp", ">=", sevenDaysAgo),
-      orderBy("serverTimestamp", "asc"),
-      limit(5000)
-    );
+    try {
+      const latestQ = query(readingsRef, orderBy("serverTimestamp", "desc"), limit(1));
 
-    const unsubChart = onSnapshot(chartQ, (snap) => {
-      const readings = snap.docs.map((d) => d.data() as Reading);
-      setChartData(readings);
-
-      if (readings.length > 0) {
-        const validBpm = readings.filter((r) => r.bpm > 0);
-        const validSpo2 = readings.filter((r) => r.spo2 !== -1 && r.spo2 > 0);
-        const fallsThisWeek = readings.filter((r) => r.fall === true);
-
-        setStats({
-          avgBpm:
-            validBpm.length > 0
-              ? Math.round(validBpm.reduce((s, r) => s + r.bpm, 0) / validBpm.length)
-              : 0,
-          avgSpo2:
-            validSpo2.length > 0
-              ? Math.round(validSpo2.reduce((s, r) => s + r.spo2, 0) / validSpo2.length)
-              : 0,
-          fallCount: fallsThisWeek.length,
-        });
-      }
-    });
-
-    const alertsRef = collection(db, "patients", selectedPatientId, "alerts");
-    const alertsQ = query(alertsRef, orderBy("timestamp", "desc"), limit(50));
-
-    const unsubAlerts = onSnapshot(alertsQ, (snap) => {
-      setAlerts(
-        snap.docs.map((d) => ({ id: d.id, ...d.data() } as Alert))
+      unsubLatest = onSnapshot(
+        latestQ,
+        (snap) => {
+          if (!snap.empty) {
+            setLatestReading(snap.docs[0].data() as Reading);
+          }
+        },
+        (err) => {
+          console.warn("Firestore latest reading failed, loading demo data:", err);
+          loadDemoFallback();
+        }
       );
-    });
+
+      const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const chartQ = query(
+        readingsRef,
+        where("serverTimestamp", ">=", sevenDaysAgo),
+        orderBy("serverTimestamp", "asc"),
+        limit(5000)
+      );
+
+      unsubChart = onSnapshot(
+        chartQ,
+        (snap) => {
+          const readings = snap.docs.map((d) => d.data() as Reading);
+          setChartData(readings);
+
+          if (readings.length > 0) {
+            const validBpm = readings.filter((r) => r.bpm > 0);
+            const validSpo2 = readings.filter((r) => r.spo2 !== -1 && r.spo2 > 0);
+            const fallsThisWeek = readings.filter((r) => r.fall === true);
+
+            setStats({
+              avgBpm:
+                validBpm.length > 0
+                  ? Math.round(validBpm.reduce((s, r) => s + r.bpm, 0) / validBpm.length)
+                  : 0,
+              avgSpo2:
+                validSpo2.length > 0
+                  ? Math.round(validSpo2.reduce((s, r) => s + r.spo2, 0) / validSpo2.length)
+                  : 0,
+              fallCount: fallsThisWeek.length,
+            });
+          }
+        },
+        (err) => {
+          console.warn("Firestore chart snapshot failed:", err);
+        }
+      );
+
+      const alertsRef = collection(db, "patients", selectedPatientId, "alerts");
+      const alertsQ = query(alertsRef, orderBy("timestamp", "desc"), limit(50));
+
+      unsubAlerts = onSnapshot(
+        alertsQ,
+        (snap) => {
+          setAlerts(
+            snap.docs.map((d) => ({ id: d.id, ...d.data() } as Alert))
+          );
+        },
+        (err) => {
+          console.warn("Firestore alerts snapshot failed:", err);
+          setAlerts(getDemoAlerts() as Alert[]);
+        }
+      );
+    } catch (err) {
+      console.warn("Firestore query setup failed:", err);
+      loadDemoFallback();
+    }
 
     return () => {
-      unsubLatest();
-      unsubChart();
-      unsubAlerts();
+      if (unsubLatest) unsubLatest();
+      if (unsubChart) unsubChart();
+      if (unsubAlerts) unsubAlerts();
     };
-  }, [selectedPatientId]);
+  }, [selectedPatientId, usingDemoData]);
+
+  function loadDemoFallback() {
+    setUsingDemoData(true);
+    const demoReadings = generateDemoReadings(168);
+    setChartData(demoReadings as Reading[]);
+    if (demoReadings.length > 0) {
+      setLatestReading(demoReadings[demoReadings.length - 1] as Reading);
+      const validBpm = demoReadings.filter((r) => r.bpm > 0);
+      const validSpo2 = demoReadings.filter((r) => r.spo2 !== -1 && r.spo2 > 0);
+      setStats({
+        avgBpm: validBpm.length > 0
+          ? Math.round(validBpm.reduce((s, r) => s + r.bpm, 0) / validBpm.length)
+          : 0,
+        avgSpo2: validSpo2.length > 0
+          ? Math.round(validSpo2.reduce((s, r) => s + r.spo2, 0) / validSpo2.length)
+          : 0,
+        fallCount: demoReadings.filter((r) => r.fall).length,
+      });
+    }
+    setAlerts(getDemoAlerts() as Alert[]);
+  }
 
   const handleExportReport = useCallback(async () => {
     if (!selectedPatientId || chartData.length === 0) return;
@@ -310,6 +415,12 @@ export default function DoctorDashboard() {
           </div>
         </div>
 
+        {usingDemoData && (
+          <div className="mb-4 p-3 rounded-xl bg-primary/10 border border-primary/20 text-primary text-sm animate-fade-in">
+            📊 Showing demo data — Firestore connection unavailable
+          </div>
+        )}
+
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
           <div className="np-card flex items-center gap-4 animate-slide-in">
             <div className="p-3 rounded-xl bg-alert-red/10">
@@ -420,8 +531,12 @@ export default function DoctorDashboard() {
                       const { toast } = await import("sonner");
                       toast.success("Notes saved");
                     } catch {
-                      const { toast } = await import("sonner");
-                      toast.error("Failed to save notes");
+                      // In demo mode, just show success
+                      if (usingDemoData) {
+                        toast.success("Notes saved (demo mode)");
+                      } else {
+                        toast.error("Failed to save notes");
+                      }
                     } finally {
                       setSavingNotes(false);
                     }

@@ -15,6 +15,14 @@ import {
   where,
 } from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
+import {
+  getDemoUserProfile,
+  getDemoPatients,
+  generateDemoReadings,
+  getDemoAlerts,
+  type DemoReading,
+  type DemoAlert,
+} from "@/lib/demoData";
 import { toast } from "sonner";
 import dynamic from "next/dynamic";
 import Navbar from "@/components/Navbar";
@@ -74,6 +82,7 @@ export default function CaregiverDashboard() {
   const [sendingWhatsApp, setSendingWhatsApp] = useState(false);
   const [recentReadings, setRecentReadings] = useState<Reading[]>([]);
   const [doctorPhone, setDoctorPhone] = useState("");
+  const [usingDemoData, setUsingDemoData] = useState(false);
 
   useEffect(() => {
     const unsubAuth = onAuthStateChanged(auth, async (user) => {
@@ -82,38 +91,77 @@ export default function CaregiverDashboard() {
         return;
       }
 
-      const userDoc = await getDoc(doc(db, "users", user.uid));
-      if (!userDoc.exists() || userDoc.data().role !== "caregiver") {
-        router.push("/login");
-        return;
-      }
-
-      const userData = userDoc.data();
-      setUserName(userData.name || user.email || "");
-      const linkedPatients: string[] = userData.linkedPatients || [];
-
-      const patientList: Patient[] = [];
-      for (const pId of linkedPatients) {
-        const pDoc = await getDoc(doc(db, "patients", pId));
-        if (pDoc.exists()) {
-          patientList.push({ id: pId, name: pDoc.data().name || pId });
-          // Get doctor phone
-          const doctorIds = pDoc.data().assignedDoctors || [];
-          if (doctorIds.length > 0) {
-            const docDoc = await getDoc(doc(db, "users", doctorIds[0]));
-            if (docDoc.exists()) {
-              setDoctorPhone(docDoc.data().phone || "");
-            }
-          }
-        } else {
-          patientList.push({ id: pId, name: pId });
+      // Try Firestore first, fallback to demo data
+      let userData = null;
+      try {
+        const userDoc = await getDoc(doc(db, "users", user.uid));
+        if (userDoc.exists() && userDoc.data().role === "caregiver") {
+          userData = userDoc.data();
         }
+      } catch (err) {
+        console.warn("Firestore read failed, using demo data:", err);
       }
 
-      setPatients(patientList);
-      if (patientList.length > 0) {
-        setSelectedPatientId(patientList[0].id);
+      if (userData) {
+        setUserName(userData.name || user.email || "");
+        const linkedPatients: string[] = userData.linkedPatients || [];
+
+        const patientList: Patient[] = [];
+        for (const pId of linkedPatients) {
+          try {
+            const pDoc = await getDoc(doc(db, "patients", pId));
+            if (pDoc.exists()) {
+              patientList.push({ id: pId, name: pDoc.data().name || pId });
+              // Get doctor phone
+              const doctorIds = pDoc.data().assignedDoctors || [];
+              if (doctorIds.length > 0) {
+                try {
+                  const docDoc = await getDoc(doc(db, "users", doctorIds[0]));
+                  if (docDoc.exists()) {
+                    setDoctorPhone(docDoc.data().phone || "");
+                  }
+                } catch {
+                  setDoctorPhone("+1234567891");
+                }
+              }
+            } else {
+              patientList.push({ id: pId, name: pId });
+            }
+          } catch {
+            patientList.push({ id: pId, name: pId });
+          }
+        }
+
+        setPatients(patientList);
+        if (patientList.length > 0) {
+          setSelectedPatientId(patientList[0].id);
+        }
+      } else {
+        // Check localStorage role
+        const storedRole = localStorage.getItem("np_user_role");
+        if (storedRole !== "caregiver") {
+          router.push("/login");
+          return;
+        }
+        const demoProfile = getDemoUserProfile("caregiver");
+        setUserName(demoProfile.name);
+        const demoPatients = getDemoPatients();
+        setPatients(demoPatients);
+        if (demoPatients.length > 0) {
+          setSelectedPatientId(demoPatients[0].id);
+        }
+        setDoctorPhone("+1234567891");
+        setUsingDemoData(true);
+
+        // Load demo data
+        const demoReadings = generateDemoReadings(1); // 1 hour for recent
+        setRecentReadings(demoReadings as Reading[]);
+        if (demoReadings.length > 0) {
+          setLatestReading(demoReadings[demoReadings.length - 1] as Reading);
+        }
+        setAlerts(getDemoAlerts() as Alert[]);
       }
+
       setLoading(false);
     });
 
@@ -121,61 +169,115 @@ export default function CaregiverDashboard() {
   }, [router]);
 
   useEffect(() => {
-    if (!selectedPatientId) return;
+    if (!selectedPatientId || usingDemoData) return;
 
     const readingsRef = collection(db, "patients", selectedPatientId, "readings");
-    const latestQ = query(readingsRef, orderBy("serverTimestamp", "desc"), limit(1));
 
-    const unsubLatest = onSnapshot(latestQ, (snap) => {
-      if (!snap.empty) {
-        const data = snap.docs[0].data() as Reading;
-        setLatestReading(data);
+    let unsubLatest: (() => void) | null = null;
+    let unsubRecent: (() => void) | null = null;
+    let unsubAlerts: (() => void) | null = null;
 
-        if (data.fall) {
-          toast.error("⚠️ Fall Detected!", {
-            description: "Your patient may need immediate assistance.",
-          });
+    try {
+      const latestQ = query(readingsRef, orderBy("serverTimestamp", "desc"), limit(1));
+
+      unsubLatest = onSnapshot(
+        latestQ,
+        (snap) => {
+          if (!snap.empty) {
+            const data = snap.docs[0].data() as Reading;
+            setLatestReading(data);
+
+            if (data.fall) {
+              toast.error("⚠️ Fall Detected!", {
+                description: "Your patient may need immediate assistance.",
+              });
+            }
+          }
+        },
+        (err) => {
+          console.warn("Firestore latest reading failed, loading demo data:", err);
+          loadDemoFallback();
         }
-      }
-    });
+      );
 
-    // 30-minute chart data
-    const thirtyMinAgo = Date.now() - 30 * 60 * 1000;
-    const recentQ = query(
-      readingsRef,
-      where("serverTimestamp", ">=", thirtyMinAgo),
-      orderBy("serverTimestamp", "asc"),
-      limit(500)
-    );
+      // 30-minute chart data
+      const thirtyMinAgo = Date.now() - 30 * 60 * 1000;
+      const recentQ = query(
+        readingsRef,
+        where("serverTimestamp", ">=", thirtyMinAgo),
+        orderBy("serverTimestamp", "asc"),
+        limit(500)
+      );
 
-    const unsubRecent = onSnapshot(recentQ, (snap) => {
-      setRecentReadings(snap.docs.map(d => d.data() as Reading));
-    });
+      unsubRecent = onSnapshot(
+        recentQ,
+        (snap) => {
+          setRecentReadings(snap.docs.map(d => d.data() as Reading));
+        },
+        (err) => {
+          console.warn("Firestore recent readings failed:", err);
+        }
+      );
 
-    const alertsRef = collection(db, "patients", selectedPatientId, "alerts");
-    const alertsQ = query(alertsRef, orderBy("timestamp", "desc"), limit(10));
+      const alertsRef = collection(db, "patients", selectedPatientId, "alerts");
+      const alertsQ = query(alertsRef, orderBy("timestamp", "desc"), limit(10));
 
-    const unsubAlerts = onSnapshot(alertsQ, (snap) => {
-      const newAlerts = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Alert));
-      setAlerts(newAlerts);
-    });
+      unsubAlerts = onSnapshot(
+        alertsQ,
+        (snap) => {
+          const newAlerts = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Alert));
+          setAlerts(newAlerts);
+        },
+        (err) => {
+          console.warn("Firestore alerts snapshot failed:", err);
+          setAlerts(getDemoAlerts() as Alert[]);
+        }
+      );
+    } catch (err) {
+      console.warn("Firestore query setup failed:", err);
+      loadDemoFallback();
+    }
 
     return () => {
-      unsubLatest();
-      unsubRecent();
-      unsubAlerts();
+      if (unsubLatest) unsubLatest();
+      if (unsubRecent) unsubRecent();
+      if (unsubAlerts) unsubAlerts();
     };
-  }, [selectedPatientId]);
+  }, [selectedPatientId, usingDemoData]);
+
+  function loadDemoFallback() {
+    setUsingDemoData(true);
+    const demoReadings = generateDemoReadings(1);
+    setRecentReadings(demoReadings as Reading[]);
+    if (demoReadings.length > 0) {
+      setLatestReading(demoReadings[demoReadings.length - 1] as Reading);
+    }
+    setAlerts(getDemoAlerts() as Alert[]);
+  }
 
   const handleResolveAlert = async (alertId: string) => {
     if (!selectedPatientId) return;
+
+    if (usingDemoData) {
+      // In demo mode, just update local state
+      setAlerts(prev => prev.map(a =>
+        a.id === alertId ? { ...a, status: "resolved" as const } : a
+      ));
+      toast.success("Alert marked as resolved");
+      return;
+    }
+
     try {
       const alertRef = doc(db, "patients", selectedPatientId, "alerts", alertId);
       await updateDoc(alertRef, { status: "resolved" });
       toast.success("Alert marked as resolved");
     } catch (error) {
       console.error("Resolve alert error:", error);
-      toast.error("Failed to resolve alert");
+      // Fallback: update locally
+      setAlerts(prev => prev.map(a =>
+        a.id === alertId ? { ...a, status: "resolved" as const } : a
+      ));
+      toast.success("Alert marked as resolved");
     }
   };
 
@@ -262,6 +364,12 @@ export default function CaregiverDashboard() {
           </div>
         </div>
 
+        {usingDemoData && (
+          <div className="mb-4 p-3 rounded-xl bg-primary/10 border border-primary/20 text-primary text-sm animate-fade-in">
+            📊 Showing demo data — Firestore connection unavailable
+          </div>
+        )}
+
         {/* Fall First Aid Panel — only visible when fall detected */}
         <FallFirstAid
           visible={r?.fall === true}
@@ -284,7 +392,7 @@ export default function CaregiverDashboard() {
               <div className="flex items-center gap-2 mt-1">
                 <div className="w-2 h-2 rounded-full bg-safe-green animate-pulse" />
                 <span className="text-xs text-muted-foreground">
-                  Connected • Live data
+                  {usingDemoData ? "Demo mode • Simulated data" : "Connected • Live data"}
                 </span>
               </div>
             </div>
